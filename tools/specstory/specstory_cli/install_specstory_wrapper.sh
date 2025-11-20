@@ -125,9 +125,21 @@ export PATH="$HOME/bin:$PATH"
 alias claude="specstory run claude --no-cloud-sync"
 EOF
 
-  echo "✔ Hook installed for environment: $ENV_NAME"
+  # Create deactivation hook to unset alias when leaving environment
+  DEACTIVATE_HOOK_DIR="$ENV_PATH/etc/conda/deactivate.d"
+  mkdir -p "$DEACTIVATE_HOOK_DIR"
+
+  echo "➡ Adding deactivation hook ONLY for env '$ENV_NAME' → $DEACTIVATE_HOOK_DIR/specstory.sh"
+
+  cat > "$DEACTIVATE_HOOK_DIR/specstory.sh" <<'EOF'
+unalias claude 2>/dev/null || true
+EOF
+
+  echo "✔ Activation and deactivation hooks installed for environment: $ENV_NAME"
   echo "➡ When you run:  conda activate $ENV_NAME"
   echo "   The alias 'claude' will route through specstory. Please note that "claude" cannot accept arguments."
+  echo "➡ When you run:  conda deactivate"
+  echo "   The alias 'claude' will be removed."
 fi
 
 echo
