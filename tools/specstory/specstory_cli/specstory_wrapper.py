@@ -12,49 +12,111 @@ import json
 from typing import List, Optional
 
 # Dynamically find specstory-real, handling homebrew upgrades
+def is_wrapper_script(path):
+    """Check if a given path is the wrapper script (bash or Python)."""
+    if not path or not os.path.exists(path):
+        return False
+
+    path_abs = os.path.abspath(path)
+    wrapper_bash = os.path.abspath(os.path.expanduser("~/bin/specstory"))
+    wrapper_py = os.path.abspath(os.path.expanduser("~/.specstory_wrapper/specstory_wrapper.py"))
+
+    if path_abs in (wrapper_bash, wrapper_py):
+        return True
+
+    # Check file content for wrapper signature (errors='ignore' handles binary files gracefully)
+    with open(path, 'r', encoding='utf-8', errors='ignore') as f:
+        content = f.read(500)
+        return 'specstory_wrapper.py' in content
+
+def filter_wrapper_from_path():
+    """Return PATH with wrapper directories removed."""
+    wrapper_dirs = {os.path.expanduser("~/bin"), os.path.dirname(os.path.abspath(os.path.expanduser("~/bin/specstory")))}
+    path_parts = os.environ.get("PATH", "").split(os.pathsep)
+    return os.pathsep.join([p for p in path_parts if p not in wrapper_dirs])
+
 def find_real_specstory():
     """Find the real specstory binary, handling homebrew version changes."""
-    try:
-        prefix = subprocess.check_output(
-            ["brew", "--prefix"],
-            text=True,
-            stderr=subprocess.DEVNULL
-        ).strip()
-        real_path = os.path.join(prefix, "bin", "specstory-real")
+    # Check environment variable first
+    env_path = os.environ.get("SPECSTORY_ORIGINAL") or os.environ.get("SPECSTORY_REAL") or os.environ.get("ORIGINAL_SPECSTORY")
+    if env_path:
+        env_path = os.path.expanduser(env_path)
+        if os.path.isabs(env_path) and os.path.exists(env_path) and not is_wrapper_script(env_path):
+            return os.path.abspath(env_path)
 
-        # If specstory-real exists and is valid, use it
-        if os.path.exists(real_path):
-            # Check if it's a broken symlink
-            if os.path.islink(real_path):
-                try:
-                    os.stat(real_path)  # Will raise if symlink is broken
+    # Try homebrew installation if brew is available
+    if shutil.which("brew"):
+        try:
+            prefix = subprocess.run(["brew", "--prefix"], capture_output=True, text=True).stdout.strip()
+            if prefix:
+                real_path = os.path.join(prefix, "bin", "specstory-real")
+
+                # Check if specstory-real exists and is valid
+                if os.path.exists(real_path) and not os.path.islink(real_path) and not is_wrapper_script(real_path):
                     return real_path
-                except OSError:
-                    # Broken symlink, fix it
-                    pass
-            else:
-                return real_path
 
-        # specstory-real doesn't exist or is broken, find the current version
-        specstory_path = subprocess.check_output(
-            ["brew", "--prefix", "specstory"],
-            text=True,
-            stderr=subprocess.DEVNULL
-        ).strip()
+                # Get current specstory version and create/fix symlink
+                specstory_path = subprocess.run(["brew", "--prefix", "specstory"], capture_output=True, text=True).stdout.strip()
+                if specstory_path:
+                    real_bin = os.path.join(specstory_path, "bin", "specstory")
+                    if os.path.exists(real_bin):
+                        if os.path.exists(real_path) or os.path.islink(real_path):
+                            os.remove(real_path)
+                        os.symlink(real_bin, real_path)
+                        return real_path
+        except Exception:
+            pass
 
-        real_bin = os.path.join(specstory_path, "bin", "specstory")
+    # Fallback: search PATH (excluding wrapper directories)
+    old_path = os.environ["PATH"]
+    os.environ["PATH"] = filter_wrapper_from_path()
+    resolved = shutil.which("specstory")
+    os.environ["PATH"] = old_path
 
-        # Create/update the specstory-real symlink
-        if os.path.exists(real_path) or os.path.islink(real_path):
-            os.remove(real_path)
-        os.symlink(real_bin, real_path)
+    if resolved and not is_wrapper_script(resolved):
+        return resolved
 
-        return real_path
-    except Exception as e:
-        # Fallback: try to find specstory-real in PATH
-        return "specstory-real"
+    # Last resort: check common system locations
+    for location in ["/usr/local/bin/specstory-real", "/usr/bin/specstory-real", "/bin/specstory-real",
+                     "/usr/local/bin/specstory", "/usr/bin/specstory", "/bin/specstory"]:
+        if os.path.exists(location) and not is_wrapper_script(location):
+            return location
+
+    return "specstory-real"
 
 REAL = find_real_specstory()
+
+# Final safety check: ensure REAL is never the wrapper
+if is_wrapper_script(REAL):
+    print(f"Error: Cannot find real specstory binary (found wrapper at {REAL})", file=sys.stderr)
+    print(f"SPECSTORY_ORIGINAL={os.environ.get('SPECSTORY_ORIGINAL', 'not set')}", file=sys.stderr)
+
+    # Try common locations as last resort
+    candidates = []
+    if shutil.which("brew"):
+        try:
+            prefix = subprocess.run(["brew", "--prefix"], capture_output=True, text=True).stdout.strip()
+            if prefix:
+                candidates.append(os.path.join(prefix, "bin", "specstory-real"))
+                candidates.append(os.path.join(prefix, "bin", "specstory"))
+        except Exception:
+            pass
+    
+    candidates.extend([
+        "/opt/homebrew/bin/specstory-real",
+        "/usr/local/bin/specstory-real",
+        "/usr/bin/specstory",
+        "/bin/specstory"
+    ])
+
+    for candidate in candidates:
+        if candidate and os.path.exists(candidate) and not is_wrapper_script(candidate):
+            REAL = candidate
+            print(f"Found real specstory at: {REAL}", file=sys.stderr)
+            break
+    else:
+        print("Error: Could not find real specstory binary. Please reinstall.", file=sys.stderr)
+        sys.exit(1)
 HIST_DIR = ".specstory/history"
 TS_DIR = ".specstory/timestamps"
 
@@ -303,8 +365,8 @@ def merge_all_timestamps():
 def stop_watcher():
     """Stop the background watcher started by this process and remove its pidfile."""
     pidfile = f"/tmp/specstory_watcher_{os.getpid()}"
-    # Wait briefly for the pidfile to be populated if watcher is still starting
 
+    # Wait briefly for the pidfile to be populated
     deadline = time.time() + 2.0
     pid_text = None
     while time.time() < deadline:
@@ -316,33 +378,24 @@ def stop_watcher():
         time.sleep(0.1)
 
     if not pid_text:
-        # Nothing to stop; clean up any empty pidfile
         if os.path.exists(pidfile):
             os.remove(pidfile)
         return
 
-    # Try JSON metadata first
-    target = None
-    try:
-        meta = json.loads(pid_text)
-        pid = int(meta.get("pid"))
-        target = meta.get("target")
-    except Exception:
-        pid = int(pid_text)
+    # Parse PID from JSON or plain text
+    pid = json.loads(pid_text).get("pid") if pid_text.startswith('{') else int(pid_text)
 
-    # Attempt graceful stop
-    try:
-        os.killpg(pid, signal.SIGTERM)
-    except Exception:
-        os.kill(pid, signal.SIGTERM)
-
-    # If still alive, escalate
-    time.sleep(0.2)
-    os.kill(pid, 0)
-    try:
-        os.killpg(pid, signal.SIGKILL)
-    except Exception:
-        os.kill(pid, signal.SIGKILL)
+    # Kill process group or individual process
+    for sig in [signal.SIGTERM, signal.SIGKILL]:
+        try:
+            os.killpg(pid, sig)
+        except (OSError, ProcessLookupError):
+            try:
+                os.kill(pid, sig)
+            except (OSError, ProcessLookupError):
+                break
+        if sig == signal.SIGTERM:
+            time.sleep(0.2)
 
     if os.path.exists(pidfile):
         os.remove(pidfile)
@@ -356,56 +409,42 @@ def print_specstory_banner():
     RESET = "\033[0m"
     BOLD = "\033[1m"
     
-    print(f"{CYAN}╭{'─' * 50}╮{RESET}")
-    print(f"{CYAN}│{RESET} {GREEN}{BOLD}📝 SpecStory Recording Active{RESET}{'':>20}{CYAN}│{RESET}")
-    print(f"{CYAN}│{RESET}    Session will be logged to .specstory/{'':>9}{CYAN}│{RESET}")
-    print(f"{CYAN}╰{'─' * 50}╯{RESET}")
-    print()
+    # Print to stderr so it doesn't interfere with tool output
+    print(f"{CYAN}╭{'─' * 50}╮{RESET}", file=sys.stderr)
+    print(f"{CYAN}│{RESET} {GREEN}{BOLD}📝 SpecStory Recording Active{RESET}{'':>20}{CYAN}│{RESET}", file=sys.stderr)
+    print(f"{CYAN}│{RESET}    Session will be logged to .specstory/{'':>9}{CYAN}│{RESET}", file=sys.stderr)
+    print(f"{CYAN}╰{'─' * 50}╯{RESET}", file=sys.stderr)
+    print(file=sys.stderr)
+    sys.stderr.flush()  # Ensure banner is displayed immediately
 
 
 def main():
     """Entry point: start watcher, run real tool, then merge timestamps."""
+    # Debug: print to stderr to verify execution
+    # print(f"DEBUG: specstory_wrapper.py called with {sys.argv}", file=sys.stderr)
+    
     os.makedirs(TS_DIR, exist_ok=True)
 
-    # Show indicator that specstory is active
-    print_specstory_banner()
+    if len(sys.argv) > 1 and sys.argv[1] == 'run':
+        print_specstory_banner()
 
-    # Do not kill other watchers at startup to avoid stopping active sessions
-
-    # Get timestamp of most recent existing file (if any)
     before_file = get_most_recent_md_file()
-    before_mtime = None
-    if before_file:
-        before_mtime = os.path.getmtime(before_file)
+    before_mtime = os.path.getmtime(before_file) if before_file else None
 
-    # Start watcher in background
     start_watcher(before_file, before_mtime)
 
-    # Run SpecStory in foreground
+    # Run SpecStory
     result = subprocess.run([REAL] + sys.argv[1:])
-    status = result.returncode
 
-    # Give watcher time to finish writing
+    # Give watcher time to finish, then stop it
     time.sleep(POLL_INTERVAL * 5)
-
-    # Capture target md before stopping watcher
-    pidfile = f"/tmp/specstory_watcher_{os.getpid()}"
-    target_md = None
-    if os.path.exists(pidfile):
-        with open(pidfile, 'r') as f:
-            content = f.read().strip()
-        if content:
-            meta = json.loads(content)
-            target_md = meta.get("target")
-
-    # Stop the watcher before modifying the markdown so it doesn't record the merge
     stop_watcher()
     time.sleep(POLL_INTERVAL * 2)
 
-    # Merge timestamps into all markdown files (multiple files can change per session)
+    # Merge timestamps into all markdown files
     merge_all_timestamps()
 
-    sys.exit(status)
+    sys.exit(result.returncode)
 
 if __name__ == "__main__":
     main()
